@@ -102,11 +102,22 @@ int CRC_Tx = 0xd37e11c9;
 int CRC_Rx = 0;
 
 /* HELLO ECE-330L */
+/* BATTLESHIP title message */
+/* BATTLESHIP title marquee */
 char Message[] =
-		{SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,
-		CHAR_H,CHAR_E,CHAR_L,CHAR_L,CHAR_O,SPACE,CHAR_E,CHAR_C,CHAR_E,DASH,CHAR_3,CHAR_3,CHAR_0,CHAR_L,
-		SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE,SPACE};
+{
+    /* Leading spaces: lets BATTLESHIP scroll in from the right */
+    SPACE, SPACE, SPACE, SPACE,
+    SPACE, SPACE, SPACE, SPACE,
 
+    /* Game title */
+    CHAR_B, CHAR_A, CHAR_T, CHAR_T, CHAR_L,
+    CHAR_E, CHAR_S, CHAR_H, CHAR_I, CHAR_P,
+
+    /* Trailing spaces: lets BATTLESHIP scroll off the left */
+    SPACE, SPACE, SPACE, SPACE,
+    SPACE, SPACE, SPACE, SPACE
+};
 /* Declare array for Song */
 Music Song[100];
 
@@ -155,6 +166,15 @@ int main(void)
   GPIOE->MODER |= 0x55555555; // Port E mode register - make E0 to E15 outputs
   GPIOC->MODER |= 0x0; // Port C mode register - all inputs
   GPIOE->ODR = 0xFFFF; // Set all Port E pins high
+
+  /*** Initialize Battleship title marquee ***/
+  Save_Pointer = Message;
+  Message_Pointer = Message;
+
+  Message_Length = sizeof(Message);
+
+  Delay_msec = 200;
+  Delay_counter = 0;
 
   /*** Configure ADC1 ***/
   RCC->APB2ENR |= 1<<8;  // Turn on ADC1 clock by forcing bit 8 to 1 while keeping other bits unchanged
