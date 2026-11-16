@@ -20,6 +20,7 @@
 #include "main.h"
 #include "usb_host.h"
 #include "seg7.h"
+#include <stdint.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -53,6 +54,49 @@ TIM_HandleTypeDef htim7;
 
 /* USER CODE BEGIN PV */
 int DelayValue = 50;
+
+/*
+ * Battleship board storage.
+ *
+ * Vertical map: 2 rows x 16 columns.
+ *   Bits 31..16 = top row, columns 0..15.
+ *   Bits 15..0  = bottom row, columns 0..15.
+ *
+ * Horizontal map: 3 rows x 8 columns.
+ *   Bits  7..0  = row 0, columns 0..7.
+ *   Bits 15..8  = row 1, columns 0..7.
+ *   Bits 23..16 = row 2, columns 0..7.
+ *   Bits 31..24 are unused.
+ *
+ * A set bit (1) means that a boat occupies that cell.
+ */
+volatile uint32_t Player1_Vertical_Map = 0;
+volatile uint32_t Player1_Horizontal_Map = 0;
+volatile uint32_t Player2_Vertical_Map = 0;
+volatile uint32_t Player2_Horizontal_Map = 0;
+
+/* Placement state: Player 1 places first, then Player 2. */
+volatile uint8_t Current_Player = 1;
+volatile uint8_t Boats_Placed = 0;       /* 0..4 for each player */
+volatile uint8_t Placement_Complete = 0;
+
+/* Cursor/map state. */
+volatile uint8_t Cursor_X = 0;
+volatile uint8_t Cursor_Y = 0;
+volatile uint8_t Selected_Map = 0;       /* 0 = vertical, 1 = horizontal */
+volatile uint8_t Cursor_Blink_On = 1;    /* For the board-display renderer */
+volatile uint8_t Last_Placement_Succeeded = 0;
+volatile uint8_t Last_Placement_Failed = 0;
+
+/* Potentiometers: PA0 = left/right, PA1 = up/down. */
+#define POT_LEFT_RIGHT_CHANNEL  0U
+#define POT_UP_DOWN_CHANNEL     1U
+
+/* Switch 6 = PC10 map selection; Switch 7 = PC11 placement confirmation.
+ * This implementation assumes the switches pull the input LOW when active.
+ */
+#define MAP_SELECT_PIN          (1U << 10)
+#define PLACE_BUTTON_PIN        (1U << 11)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -65,6 +109,12 @@ static void MX_TIM7_Init(void);
 void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
+static void Battleship_ADC_Init(void);
+static uint16_t Battleship_ADC_Read(uint8_t channel);
+static void Battleship_Update_Cursor(void);
+static void Battleship_Render_LEDs(void);
+static uint8_t Battleship_Try_Place_Boat(void);
+static uint8_t Battleship_Is_Button_Pressed(void);
 //void Play_Note(int note,int size,int tempo,int space);
 //extern void Seven_Segment_Digit (unsigned char digit, unsigned char hex_char, unsigned char dot);
 //extern void Seven_Segment(unsigned int HexValue);
@@ -176,10 +226,22 @@ int main(void)
   Delay_msec = 200;
   Delay_counter = 0;
 
-  /*** Configure ADC1 ***/
-  RCC->APB2ENR |= 1<<8;  // Turn on ADC1 clock by forcing bit 8 to 1 while keeping other bits unchanged
-  ADC1->SMPR2 |= 1; // 15 clock cycles per sample
-  ADC1->CR2 |= 1;        // Turn on ADC1 by forcing bit 0 to 1 while keeping other bits unchanged
+  /*** Configure the placement controls ***/
+  /* PC10 = Switch 6 (map select), PC11 = Switch 7 (place). */
+  GPIOC->MODER &= ~((3U << (10U * 2U)) | (3U << (11U * 2U)));
+  GPIOC->PUPDR &= ~((3U << (10U * 2U)) | (3U << (11U * 2U)));
+  GPIOC->PUPDR |=  ((1U << (10U * 2U)) | (1U << (11U * 2U))); /* Pull-ups */
+
+  /*** Configure ADC1 for the two potentiometers on PA0 and PA1 ***/
+  Battleship_ADC_Init();
+
+  /* Start with the placement cursor at the first cell. */
+  Cursor_X = 0;
+  Cursor_Y = 0;
+  Selected_Map = 0;
+  Cursor_Blink_On = 1;
+  Last_Placement_Succeeded = 0;
+  Last_Placement_Failed = 0;
 
   /*** Turn on CRC Clock in AHB1ENR to enable CRC hardware ***/
 
@@ -200,10 +262,69 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* Track the current physical state so a held button only places once. */
+  uint8_t previous_place_pressed = Battleship_Is_Button_Pressed();
+  uint32_t last_confirm_time = 0;
+  uint32_t last_cursor_update = 0;
+  uint32_t last_blink_update = HAL_GetTick();
+
   while (1)
   {
     /* USER CODE END WHILE */
     MX_USB_HOST_Process();
+
+    /* Switch 6 selects which board the potentiometers control.
+     * LOW = vertical map; HIGH = horizontal map.
+     */
+    if ((GPIOC->IDR & MAP_SELECT_PIN) == 0U)
+      Selected_Map = 0;
+    else
+      Selected_Map = 1;
+
+    uint32_t now = HAL_GetTick();
+
+    /* Read the two potentiometers often enough for smooth cursor movement. */
+    if (!Placement_Complete && (now - last_cursor_update >= 25U))
+    {
+      Battleship_Update_Cursor();
+      last_cursor_update = now;
+    }
+
+    /* Blink the cursor on the 2-row x 16-column peripheral LED display. */
+    if (now - last_blink_update >= 250U)
+    {
+      Cursor_Blink_On = (uint8_t)!Cursor_Blink_On;
+      last_blink_update = now;
+    }
+
+    Battleship_Render_LEDs();
+
+    /* Switch 7 confirms the currently selected boat location.
+     * A rising edge (released -> pressed) prevents repeated placement
+     * while the button is held down.
+     */
+    uint8_t place_pressed = Battleship_Is_Button_Pressed();
+
+    if (!Placement_Complete &&
+        place_pressed &&
+        !previous_place_pressed &&
+        (now - last_confirm_time >= 180U))
+    {
+      if (Battleship_Try_Place_Boat())
+      {
+        Last_Placement_Succeeded = 1;
+        Last_Placement_Failed = 0;
+      }
+      else
+      {
+        Last_Placement_Succeeded = 0;
+        Last_Placement_Failed = 1;
+      }
+
+      last_confirm_time = now;
+    }
+
+    previous_place_pressed = place_pressed;
 
     /* USER CODE BEGIN 3 */
   }
@@ -498,6 +619,286 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief Configure ADC1 for single conversions on PA0 (ADC channel 0)
+ *        and PA1 (ADC channel 1).
+ */
+static void Battleship_ADC_Init(void)
+{
+  /* ADC1 clock and ADC common clock prescaler (PCLK2 / 4). */
+  RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+  ADC->CCR = (ADC->CCR & ~(3U << 16)) | (1U << 16);
+
+  /* PA0 and PA1 are analog inputs. The existing project also configures
+   * PA2 and PA3 as analog, so preserve that existing configuration.
+   */
+  GPIOA->MODER |= 0x000000FFU;
+  GPIOA->PUPDR &= ~0x0000000FU;
+
+  /* 84-cycle sampling time for channels 0 and 1. */
+  ADC1->CR1 = 0;
+  ADC1->CR2 = 0;
+  ADC1->SMPR2 &= ~((7U << 0) | (7U << 3));
+  ADC1->SMPR2 |=  ((4U << 0) | (4U << 3));
+
+  /* One conversion in the regular sequence; right aligned, 12-bit. */
+  ADC1->SQR1 &= ~(0xFU << 20);
+  ADC1->CR2 |= ADC_CR2_ADON;
+}
+
+/**
+ * @brief Read one ADC channel and return a 12-bit result (0..4095).
+ */
+static uint16_t Battleship_ADC_Read(uint8_t channel)
+{
+  volatile uint32_t discard;
+
+  /* Clear any previous result and select the requested regular channel. */
+  discard = ADC1->DR;
+  (void)discard;
+  ADC1->SQR3 = (uint32_t)(channel & 0x1FU);
+
+  /* Start a software-triggered conversion and wait for completion. */
+  ADC1->CR2 |= ADC_CR2_SWSTART;
+  while ((ADC1->SR & ADC_SR_EOC) == 0U)
+  {
+    /* Wait for ADC conversion. */
+  }
+
+  return (uint16_t)(ADC1->DR & 0x0FFFU);
+}
+
+/**
+ * @brief Convert the potentiometer positions into board coordinates.
+ */
+static void Battleship_Update_Cursor(void)
+{
+  uint16_t horizontal_value = Battleship_ADC_Read(POT_LEFT_RIGHT_CHANNEL);
+  uint16_t vertical_value = Battleship_ADC_Read(POT_UP_DOWN_CHANNEL);
+
+  uint8_t width;
+  uint8_t height;
+
+  if (Selected_Map == 0U)
+  {
+    width = 16U;
+    height = 2U;
+  }
+  else
+  {
+    width = 8U;
+    height = 3U;
+  }
+
+  Cursor_X = (uint8_t)(((uint32_t)horizontal_value * width) / 4096U);
+  Cursor_Y = (uint8_t)(((uint32_t)vertical_value * height) / 4096U);
+
+  /* Defensive clamp in case of an unexpected ADC value. */
+  if (Cursor_X >= width)  Cursor_X = (uint8_t)(width - 1U);
+  if (Cursor_Y >= height) Cursor_Y = (uint8_t)(height - 1U);
+}
+
+/**
+ * @brief Render the selected player's map and blinking cursor on the
+ *        peripheral board's 2-row x 16-column LED display.
+ *
+ * Assumed wiring: GPIOD[15:0] drives the top LED row and GPIOE[15:0]
+ * drives the bottom LED row. LEDs are assumed active-high.
+ *
+ * The vertical map uses its natural 2x16 layout. The horizontal map's
+ * 3x8 cells are flattened into LED positions 0..23: the first 16 cells
+ * occupy the top LED row, and the remaining 8 occupy the first 8 LEDs
+ * of the bottom row.
+ */
+static void Battleship_Render_LEDs(void)
+{
+  uint32_t vertical_map;
+  uint32_t horizontal_map;
+  uint16_t led_top = 0U;
+  uint16_t led_bottom = 0U;
+
+  if (Current_Player == 1U)
+  {
+    vertical_map = Player1_Vertical_Map;
+    horizontal_map = Player1_Horizontal_Map;
+  }
+  else
+  {
+    vertical_map = Player2_Vertical_Map;
+    horizontal_map = Player2_Horizontal_Map;
+  }
+
+  if (Selected_Map == 0U)
+  {
+    led_top = (uint16_t)((vertical_map >> 16) & 0xFFFFU);
+    led_bottom = (uint16_t)(vertical_map & 0xFFFFU);
+
+    if (Cursor_Blink_On && Cursor_X < 16U && Cursor_Y < 2U)
+    {
+      uint16_t cursor_bit = (uint16_t)(1U << Cursor_X);
+      if (Cursor_Y == 0U)
+        led_top ^= cursor_bit;
+      else
+        led_bottom ^= cursor_bit;
+    }
+  }
+  else
+  {
+    /* Flatten the 3x8 logical map into 24 consecutive LED positions. */
+    for (uint8_t cell = 0U; cell < 24U; cell++)
+    {
+      if ((horizontal_map & (1UL << cell)) != 0U)
+      {
+        if (cell < 16U)
+          led_top |= (uint16_t)(1U << cell);
+        else
+          led_bottom |= (uint16_t)(1U << (cell - 16U));
+      }
+    }
+
+    if (Cursor_Blink_On && Cursor_X < 8U && Cursor_Y < 3U)
+    {
+      uint8_t cell = (uint8_t)(Cursor_Y * 8U + Cursor_X);
+      if (cell < 16U)
+        led_top ^= (uint16_t)(1U << cell);
+      else
+        led_bottom ^= (uint16_t)(1U << (cell - 16U));
+    }
+  }
+
+  /* Port D = top LED row; Port E = bottom LED row. */
+  GPIOD->ODR = (GPIOD->ODR & 0xFFFF0000U) | led_top;
+  GPIOE->ODR = (GPIOE->ODR & 0xFFFF0000U) | led_bottom;
+}
+
+/**
+ * @brief Return nonzero while Switch 7 (PC11) is pressed.
+ *        The input is active-low because PC11 is configured with a pull-up.
+ */
+static uint8_t Battleship_Is_Button_Pressed(void)
+{
+  return ((GPIOC->IDR & PLACE_BUTTON_PIN) == 0U) ? 1U : 0U;
+}
+
+/**
+ * @brief Attempt to place the next boat for the current player.
+ *
+ * Each player places three single-cell boats followed by two double-cell
+ * boats. A vertical double occupies the top and bottom cells in one column.
+ * A horizontal double occupies two adjacent columns in the selected row.
+ *
+ * @return 1 if placement succeeded; 0 if it overlaps or is out of bounds.
+ */
+static uint8_t Battleship_Try_Place_Boat(void)
+{
+  volatile uint32_t *vertical_map;
+  volatile uint32_t *horizontal_map;
+  uint8_t boat_is_double = (Boats_Placed >= 3U) ? 1U : 0U;
+
+  if (Placement_Complete || Boats_Placed >= 5U)
+    return 0U;
+
+  if (Current_Player == 1U)
+  {
+    vertical_map = &Player1_Vertical_Map;
+    horizontal_map = &Player1_Horizontal_Map;
+  }
+  else
+  {
+    vertical_map = &Player2_Vertical_Map;
+    horizontal_map = &Player2_Horizontal_Map;
+  }
+
+  if (Selected_Map == 0U)
+  {
+    /* Vertical board: 2 rows x 16 columns.
+     * Top row occupies bits 31..16; bottom row occupies bits 15..0.
+     */
+    if (Cursor_X >= 16U || Cursor_Y >= 2U)
+      return 0U;
+
+    if (boat_is_double)
+    {
+      /* A vertical two-cell boat starts in the top row and fills both rows. */
+      if (Cursor_Y != 0U)
+        return 0U;
+
+      uint32_t top_bit = (1UL << (16U + Cursor_X));
+      uint32_t bottom_bit = (1UL << Cursor_X);
+      uint32_t boat_bits = top_bit | bottom_bit;
+
+      if ((*vertical_map & boat_bits) != 0U)
+        return 0U;
+
+      *vertical_map |= boat_bits;
+    }
+    else
+    {
+      uint32_t bit = (Cursor_Y == 0U)
+                   ? (1UL << (16U + Cursor_X))
+                   : (1UL << Cursor_X);
+
+      if ((*vertical_map & bit) != 0U)
+        return 0U;
+
+      *vertical_map |= bit;
+    }
+  }
+  else
+  {
+    /* Horizontal board: 3 rows x 8 columns, stored as three bytes. */
+    if (Cursor_X >= 8U || Cursor_Y >= 3U)
+      return 0U;
+
+    if (boat_is_double)
+    {
+      /* Two adjacent cells in the same row; column 7 cannot be the start. */
+      if (Cursor_X >= 7U)
+        return 0U;
+
+      uint32_t first_bit = (1UL << ((8U * Cursor_Y) + Cursor_X));
+      uint32_t second_bit = (1UL << ((8U * Cursor_Y) + Cursor_X + 1U));
+      uint32_t boat_bits = first_bit | second_bit;
+
+      if ((*horizontal_map & boat_bits) != 0U)
+        return 0U;
+
+      *horizontal_map |= boat_bits;
+    }
+    else
+    {
+      uint32_t bit = (1UL << ((8U * Cursor_Y) + Cursor_X));
+
+      if ((*horizontal_map & bit) != 0U)
+        return 0U;
+
+      *horizontal_map |= bit;
+    }
+  }
+
+  /* Successful placement: advance to the next boat. */
+  Boats_Placed++;
+
+  if (Boats_Placed >= 5U)
+  {
+    if (Current_Player == 1U)
+    {
+      /* Player 1 is finished; now begin Player 2's five placements. */
+      Current_Player = 2U;
+      Boats_Placed = 0U;
+      Cursor_X = 0U;
+      Cursor_Y = 0U;
+    }
+    else
+    {
+      /* Both players have placed all five boats. */
+      Placement_Complete = 1U;
+    }
+  }
+
+  return 1U;
+}
 
 /* USER CODE END 4 */
 
